@@ -10,10 +10,7 @@ from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import make_pipeline
 
 from .registry import register_model
-from ..utils.warp_utils import WarpMedian
-from ..utils.sampling_utils import make_3d_uniform_coord_triangle
 from .block.config import dinov3_model_configs
-from .block.prompt_models import GeneralPromptModel, SelfAttnPromptModel
 from .block.implicit_decoder import ImplicitHead
 from .block.convolution import BasicEncoder
 
@@ -34,15 +31,6 @@ def _resolve_local_dinov3_repo() -> str:
         )
     return dinov3_repo
 
-
-def _make_dense_query_coord(batch: int, h: int, w: int, device: torch.device) -> torch.Tensor:
-    """Create dense 2D query coordinates in [-1, 1], order (y, x)."""
-    ys = ((torch.arange(h, device=device, dtype=torch.float32) + 0.5) / max(float(h), 1.0)) * 2.0 - 1.0
-    xs = ((torch.arange(w, device=device, dtype=torch.float32) + 0.5) / max(float(w), 1.0)) * 2.0 - 1.0
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-    query = torch.stack([grid_y, grid_x], dim=-1).reshape(1, -1, 2)
-    return query.expand(batch, -1, -1).contiguous()
-                      
 
 @dataclass
 class _InferenceState:
@@ -257,142 +245,6 @@ class _BaseInfiniDepthModel(nn.Module):
         if return_dino_tokens:
             return depth, dino_tokens
         return depth
-
-    def _prepare_dense_depthmap_for_gs(
-        self,
-        pred_depth: torch.Tensor,
-        batch: int,
-        h: int,
-        w: int,
-    ) -> torch.Tensor:
-        if pred_depth.ndim == 4:
-            return pred_depth
-        if pred_depth.ndim == 3 and pred_depth.shape[1] == h * w and pred_depth.shape[2] == 1:
-            return pred_depth.permute(0, 2, 1).reshape(batch, 1, h, w)
-        raise ValueError(
-            f"Unsupported pred_depth shape for dense GS depthmap conversion: {tuple(pred_depth.shape)}"
-        )
-
-    @torch.no_grad()
-    def inference_for_gs(
-        self,
-        image: torch.Tensor,
-        intrinsics: torch.Tensor,
-        gt_depth: torch.Tensor,
-        gt_depth_mask: torch.Tensor,
-        prompt_depth: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        sky_mask: Optional[torch.Tensor] = None,
-        sample_point_num: int = 200000,
-        coord_deterministic_sampling: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """GS-specific inference with two steps:
-        step1: 2D-uniform dense query; step2: 3D-uniform triangle query."""
-        b, _, h, w = image.shape
-
-        query = _make_dense_query_coord(b, h, w, image.device)
-        pred_depth, _, dino_tokens = self.inference(
-            image=image,
-            query_coord=query,
-            gt_depth=gt_depth,
-            gt_depth_mask=gt_depth_mask,
-            prompt_depth=prompt_depth,
-            prompt_mask=prompt_mask,
-            use_batch_infer=True,
-            return_dino_tokens=True,
-        )
-        depthmap = self._prepare_dense_depthmap_for_gs(pred_depth, b, h, w)
-
-        sampled_coords = []
-        for bi in range(b):
-            coord_b = make_3d_uniform_coord_triangle(
-                depth_hw=depthmap[bi, 0],
-                fx=float(intrinsics[bi, 0, 0].item()),
-                fy=float(intrinsics[bi, 1, 1].item()),
-                cx=float(intrinsics[bi, 0, 2].item()),
-                cy=float(intrinsics[bi, 1, 2].item()),
-                N=sample_point_num,
-                coord_norm="minus_one_to_one",
-                sample_filter_mode="max_depth",
-                sky_mask_hw=None if sky_mask is None else sky_mask[bi],
-                deterministic=coord_deterministic_sampling,
-            )
-            sampled_coords.append(coord_b)
-        query_3d_uniform_coord = torch.stack(sampled_coords, dim=0)  # [B, N, 2]
-
-        pred_depth_3d, _ = self.inference(
-            image=image,
-            query_coord=query_3d_uniform_coord,
-            gt_depth=gt_depth,
-            gt_depth_mask=gt_depth_mask,
-            prompt_depth=prompt_depth,
-            prompt_mask=prompt_mask,
-            use_batch_infer=True,
-            return_dino_tokens=False,
-        )
-        return depthmap, dino_tokens, query_3d_uniform_coord, pred_depth_3d
-
-
-@register_model("InfiniDepth_DepthSensor")
-class InfiniDepth_DepthSensor(_BaseInfiniDepthModel):
-    def _init_variant_modules(self):
-        self.prompt_model = GeneralPromptModel(
-            prompt_stage=[3],
-            block=SelfAttnPromptModel(num_blocks=4, pe="qk"),
-        )
-        self.warp_func = WarpMedian()
-
-    def _transform_features(
-        self,
-        features,
-        patch_h: int,
-        patch_w: int,
-        state: _InferenceState,
-    ):  
-        return self.prompt_model(
-            features,
-            state.prompt_depth,
-            state.prompt_mask,
-            patch_h,
-            patch_w,
-        )
-
-    def _prepare_inference(self, state: _InferenceState) -> _InferenceState:
-        if (
-            state.prompt_depth is None
-            or state.prompt_mask is None
-            or state.gt_depth is None
-            or state.gt_depth_mask is None
-        ):
-            raise ValueError(
-                "InfiniDepth_DepthSensor inference requires gt_depth, gt_depth_mask, prompt_depth, and prompt_mask."
-            )
-        prompt_depth, prompt_mask, reference_meta = self.warp_func.warp(
-            state.prompt_depth,
-            prompt_depth=state.prompt_depth,
-            prompt_mask=state.prompt_mask,
-            ground_truth=state.gt_depth,
-            ground_truth_mask=state.gt_depth_mask,
-        )
-        state.prompt_depth = prompt_depth
-        state.prompt_mask = prompt_mask
-        state.reference_meta = reference_meta
-        return state
-
-    def _postprocess_inference(
-        self,
-        pred: torch.Tensor,
-        image: torch.Tensor,
-        state: _InferenceState,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if state.reference_meta is None:
-            raise ValueError("reference_meta is required for InfiniDepth_DepthSensor postprocessing.")
-        pred = self.warp_func.unwarp(
-            pred,
-            reference_meta=state.reference_meta[..., 0],
-        )
-        return self._to_depth_disparity(pred)
-
 
 @register_model("InfiniDepth")
 class InfiniDepth(_BaseInfiniDepthModel):

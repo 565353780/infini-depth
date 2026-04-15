@@ -1,17 +1,15 @@
 from dataclasses import dataclass
-from typing import Literal, Optional
-import os
+from typing import Literal, Optional, Union
 
+import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 import tyro
 
 from InfiniDepth.utils.inference_utils import (
     OUTPUT_RESOLUTION_MODES,
     apply_sky_mask_to_depth,
     build_scaled_intrinsics_matrix,
-    prepare_metric_depth_inputs,
     resolve_camera_intrinsics_for_inference,
     resolve_depth_output_paths,
     resolve_output_size_from_mode,
@@ -19,7 +17,6 @@ from InfiniDepth.utils.inference_utils import (
 )
 from InfiniDepth.utils.io_utils import (
     depth2pcd,
-    depth_to_disparity,
     load_image,
     plot_depth,
     save_depth_array,
@@ -31,33 +28,25 @@ from InfiniDepth.utils.sampling_utils import SAMPLING_METHODS
 
 @dataclass
 class DepthInferenceArgs:
-    # Inputs
     input_image_path: str
-    input_depth_path: Optional[str] = None
 
-    # Outputs
     depth_output_dir: Optional[str] = None
     pcd_output_dir: Optional[str] = None
     save_pcd: bool = True
 
-    # Model
-    model_type: str = "InfiniDepth_DepthSensor"  # [InfiniDepth, InfiniDepth_DepthSensor]
-    depth_model_path: str = "checkpoints/depth/infinidepth_depthsensor.ckpt"
-    moge2_pretrained: str = "checkpoints/moge-2-vitl-normal/model.pt"  # Metric depth via MoGe-2 (used when input_depth_path is None)
+    model_type: str = "InfiniDepth"
+    depth_model_path: str = "checkpoints/depth/infinidepth.ckpt"
 
-    # Camera intrinsics
     fx_org: Optional[float] = None
     fy_org: Optional[float] = None
     cx_org: Optional[float] = None
     cy_org: Optional[float] = None
 
-    # Data Resolution
     input_size: tuple[int, int] = (768, 1024)
     output_size: tuple[int, int] = (768, 1024)
     output_resolution_mode: Literal["upsample", "original", "specific"] = "upsample"
     upsample_ratio: int = 1
 
-    # Optional sky segmentation
     enable_skyseg_model: bool = False
     sky_model_ckpt_path: str = "checkpoints/sky/skyseg.onnx"
 
@@ -85,8 +74,6 @@ class DepthInferenceResult:
     cx: float
     cy: float
     intrinsics_source: str
-    depth_scale_align_factor: float = 1.0
-    depth_scale_align_valid_pixels: int = 0
 
     def output_intrinsics_matrix(self) -> np.ndarray:
         return np.array(
@@ -112,87 +99,100 @@ def load_depth_model(args: DepthInferenceArgs) -> tuple[torch.nn.Module, torch.d
     return model, torch.device("cuda")
 
 
+def prepare_image_tensor(
+    image_data: Union[torch.Tensor, np.ndarray],
+    input_size: tuple[int, int] = (768, 1024),
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Convert an in-memory RGB image to the same format as ``load_image``.
+
+    Args:
+        image_data: RGB image, either (H, W, 3) uint8 [0,255] or float [0,1],
+            or (3, H, W) / (1, 3, H, W) float tensors.
+        input_size: Target (h, w) for the resized model input.
+
+    Returns:
+        org_img: (1, 3, org_h, org_w) float32 [0,1]
+        image:   (1, 3, tar_h, tar_w) float32 [0,1]
+        org_h, org_w: original spatial dimensions
+    """
+    if isinstance(image_data, torch.Tensor):
+        t = image_data.detach().cpu().float()
+        if t.ndim == 4 and t.shape[0] == 1:
+            t = t.squeeze(0)
+        if t.ndim == 3 and t.shape[0] in (1, 3):
+            t = t.permute(1, 2, 0)
+        if t.max() > 1.5:
+            t = t / 255.0
+        np_img = (t.clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+    else:
+        np_img = np.asarray(image_data)
+        if np_img.ndim == 3 and np_img.shape[0] in (1, 3) and np_img.shape[2] not in (1, 3):
+            np_img = np.moveaxis(np_img, 0, -1)
+        if np_img.dtype != np.uint8:
+            if np_img.max() <= 1.5:
+                np_img = (np.clip(np_img, 0.0, 1.0) * 255.0).astype(np.uint8)
+            else:
+                np_img = np.clip(np_img, 0, 255).astype(np.uint8)
+
+    org_h, org_w = np_img.shape[:2]
+    org_img = torch.from_numpy(np_img).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    resized = cv2.resize(np_img, (input_size[1], input_size[0]), interpolation=cv2.INTER_AREA)
+    image = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    return org_img, image, org_h, org_w
+
+
 @torch.no_grad()
-def run_depth_inference(
+def run_depth_inference_from_image(
     args: DepthInferenceArgs,
+    image_data: Union[torch.Tensor, np.ndarray],
     *,
     model: Optional[torch.nn.Module] = None,
     device: Optional[torch.device] = None,
-    input_image_path: Optional[str] = None,
-    input_depth_path: Optional[str] = None,
     fx_org: Optional[float] = None,
     fy_org: Optional[float] = None,
     cx_org: Optional[float] = None,
     cy_org: Optional[float] = None,
-    override_gt_depth=None,
-    override_gt_depth_mask=None,
-) -> DepthInferenceResult:
+) -> "DepthInferenceResult":
+    """Same as ``run_depth_inference`` but accepts an in-memory RGB image
+    instead of a file path.  This avoids disk I/O and is the preferred entry
+    point when images are already loaded (e.g. from ``Camera.toImageVis()``).
+    """
     if model is None or device is None:
         model, device = load_depth_model(args)
 
-    frame_image_path = input_image_path or args.input_image_path
-    frame_depth_path = input_depth_path if input_depth_path is not None else args.input_depth_path
-
-    org_img, image, (org_h, org_w) = load_image(frame_image_path, args.input_size)
+    org_img, image, org_h, org_w = prepare_image_tensor(image_data, args.input_size)
     image = image.to(device)
 
-    if args.model_type == "InfiniDepth_DepthSensor":
-        assert frame_depth_path is not None and os.path.exists(frame_depth_path), (
-            "InfiniDepth_DepthSensor requires a valid input depth map for depth completion. "
-            "Please provide --input_depth_path."
-        )
+    return _run_depth_inference_core(
+        args=args,
+        model=model,
+        org_img=org_img,
+        image=image,
+        org_h=org_h,
+        org_w=org_w,
+        frame_image_path="<in-memory>",
+        fx_org=fx_org,
+        fy_org=fy_org,
+        cx_org=cx_org,
+        cy_org=cy_org,
+    )
 
-    skip_metric_depth_inputs = args.model_type == "InfiniDepth" and override_gt_depth is not None
-    if skip_metric_depth_inputs:
-        gt_depth = None
-        prompt_depth = None
-        gt_depth_mask = None
-        moge2_intrinsics = None
-    else:
-        gt_depth, prompt_depth, gt_depth_mask, use_gt_depth, moge2_intrinsics = prepare_metric_depth_inputs(
-            input_depth_path=frame_depth_path,
-            input_size=args.input_size,
-            image=image,
-            device=device,
-            moge2_pretrained=args.moge2_pretrained,
-        )
-        if use_gt_depth and frame_depth_path is not None:
-            print(f"metric depth from `{frame_depth_path}`")
-        else:
-            print(f"metric depth from `{args.moge2_pretrained}`")
 
-    if override_gt_depth is not None:
-        gt_depth = _to_single_depth_tensor(
-            override_gt_depth,
-            device=device,
-            dtype=torch.float32,
-        )
-        if gt_depth.shape[-2:] != image.shape[-2:]:
-            gt_depth = F.interpolate(
-                gt_depth,
-                size=image.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        if override_gt_depth_mask is None:
-            gt_depth_mask = torch.isfinite(gt_depth) & (gt_depth > 1e-6)
-        else:
-            gt_depth_mask = _to_single_depth_tensor(
-                override_gt_depth_mask,
-                device=device,
-                dtype=torch.float32,
-            )
-            if gt_depth_mask.shape[-2:] != image.shape[-2:]:
-                gt_depth_mask = F.interpolate(
-                    gt_depth_mask,
-                    size=image.shape[-2:],
-                    mode="nearest",
-                )
-            gt_depth_mask = gt_depth_mask > 0.5
-            gt_depth_mask &= torch.isfinite(gt_depth) & (gt_depth > 1e-6)
-
-        print("metric depth from external override")
+@torch.no_grad()
+def _run_depth_inference_core(
+    args: DepthInferenceArgs,
+    model: torch.nn.Module,
+    org_img: torch.Tensor,
+    image: torch.Tensor,
+    org_h: int,
+    org_w: int,
+    frame_image_path: str,
+    fx_org: Optional[float],
+    fy_org: Optional[float],
+    cx_org: Optional[float],
+    cy_org: Optional[float],
+) -> "DepthInferenceResult":
+    """Shared inference logic used by both file-path and in-memory entry points."""
 
     frame_fx_org = args.fx_org if fx_org is None else fx_org
     frame_fy_org = args.fy_org if fy_org is None else fy_org
@@ -200,29 +200,18 @@ def run_depth_inference(
     frame_cy_org = args.cy_org if cy_org is None else cy_org
 
     frame_fx_org, frame_fy_org, frame_cx_org, frame_cy_org, intrinsics_source = resolve_camera_intrinsics_for_inference(
-        fx_org=frame_fx_org,
-        fy_org=frame_fy_org,
-        cx_org=frame_cx_org,
-        cy_org=frame_cy_org,
-        org_h=org_h,
-        org_w=org_w,
-        image=image,
-        moge2_pretrained=args.moge2_pretrained,
-        moge2_intrinsics=moge2_intrinsics,
+        frame_fx_org,
+        frame_fy_org,
+        frame_cx_org,
+        frame_cy_org,
+        org_h,
+        org_w,
     )
-    if intrinsics_source == "moge2":
-        print(
-            "Camera intrinsics are partially/fully missing. "
-            f"Using MoGe-2 estimated intrinsics in original space: fx={frame_fx_org:.2f}, fy={frame_fy_org:.2f}, cx={frame_cx_org:.2f}, cy={frame_cy_org:.2f}"
-        )
-    elif intrinsics_source == "default":
+    if intrinsics_source == "default":
         print(
             "Camera intrinsics are partially/fully missing. "
             f"Using image-size defaults in original space: fx={frame_fx_org:.2f}, fy={frame_fy_org:.2f}, cx={frame_cx_org:.2f}, cy={frame_cy_org:.2f}"
         )
-
-    gt = None if gt_depth is None else depth_to_disparity(gt_depth)
-    prompt = None if prompt_depth is None else depth_to_disparity(prompt_depth)
 
     _, _, h, w = image.shape
     fx, fy, cx, cy, _ = build_scaled_intrinsics_matrix(
@@ -254,14 +243,14 @@ def run_depth_inference(
         upsample_ratio=args.upsample_ratio,
     )
 
-    query_2d_uniform_coord = SAMPLING_METHODS["2d_uniform"]((h_sample, w_sample)).unsqueeze(0).to(device)
+    query_2d_uniform_coord = SAMPLING_METHODS["2d_uniform"]((h_sample, w_sample)).unsqueeze(0).to(image.device)
     pred_2d_uniform_depth, _ = model.inference(
         image=image,
         query_coord=query_2d_uniform_coord,
-        gt_depth=gt,
-        gt_depth_mask=gt_depth_mask,
-        prompt_depth=prompt,
-        prompt_mask=None if prompt is None else prompt > 0,
+        gt_depth=None,
+        gt_depth_mask=None,
+        prompt_depth=None,
+        prompt_mask=None,
     )
     pred_depthmap = pred_2d_uniform_depth.permute(0, 2, 1).view(1, 1, h_sample, w_sample)
 
@@ -299,77 +288,39 @@ def run_depth_inference(
     )
 
 
-def _to_single_depth_tensor(data, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    tensor = torch.as_tensor(data, device=device, dtype=dtype)
-    if tensor.ndim == 2:
-        return tensor.unsqueeze(0).unsqueeze(0)
-    if tensor.ndim == 3 and tensor.shape[0] == 1:
-        return tensor.unsqueeze(1)
-    if tensor.ndim == 4 and tensor.shape[0] == 1:
-        return tensor
-    raise ValueError(f"Expected depth-like tensor with shape [H,W], [1,H,W], or [1,1,H,W], got {tuple(tensor.shape)}")
-
-
-def scale_align_depth_result(
-    result: DepthInferenceResult,
-    reference_depth,
+@torch.no_grad()
+def run_depth_inference(
+    args: DepthInferenceArgs,
     *,
-    reference_conf=None,
-    confidence_threshold: float = 0.0,
-    min_valid_pixels: int = 128,
-    trim_quantile: float = 0.05,
-) -> tuple[float, int]:
-    pred_depth = result.pred_depthmap
-    ref_depth = _to_single_depth_tensor(reference_depth, device=pred_depth.device, dtype=pred_depth.dtype)
-    ref_depth = F.interpolate(
-        ref_depth,
-        size=(result.output_h, result.output_w),
-        mode="bilinear",
-        align_corners=False,
+    model: Optional[torch.nn.Module] = None,
+    device: Optional[torch.device] = None,
+    input_image_path: Optional[str] = None,
+    fx_org: Optional[float] = None,
+    fy_org: Optional[float] = None,
+    cx_org: Optional[float] = None,
+    cy_org: Optional[float] = None,
+) -> DepthInferenceResult:
+    if model is None or device is None:
+        model, device = load_depth_model(args)
+
+    frame_image_path = input_image_path or args.input_image_path
+
+    org_img, image, (org_h, org_w) = load_image(frame_image_path, args.input_size)
+    image = image.to(device)
+
+    return _run_depth_inference_core(
+        args=args,
+        model=model,
+        org_img=org_img,
+        image=image,
+        org_h=org_h,
+        org_w=org_w,
+        frame_image_path=frame_image_path,
+        fx_org=fx_org,
+        fy_org=fy_org,
+        cx_org=cx_org,
+        cy_org=cy_org,
     )
-
-    valid = torch.isfinite(pred_depth) & torch.isfinite(ref_depth) & (pred_depth > 1e-6) & (ref_depth > 1e-6)
-
-    if reference_conf is not None:
-        ref_conf = _to_single_depth_tensor(reference_conf, device=pred_depth.device, dtype=pred_depth.dtype)
-        ref_conf = F.interpolate(
-            ref_conf,
-            size=(result.output_h, result.output_w),
-            mode="bilinear",
-            align_corners=False,
-        )
-        valid &= torch.isfinite(ref_conf) & (ref_conf > float(confidence_threshold))
-
-    valid_count = int(valid.sum().item())
-    result.depth_scale_align_valid_pixels = valid_count
-    if valid_count < int(min_valid_pixels):
-        print(f"[Warning] Skip DA3 scale alignment: only {valid_count} valid pixels.")
-        return 1.0, valid_count
-
-    ratios = (ref_depth[valid] / pred_depth[valid]).flatten()
-    ratios = ratios[torch.isfinite(ratios) & (ratios > 0)]
-    if ratios.numel() < int(min_valid_pixels):
-        valid_count = int(ratios.numel())
-        result.depth_scale_align_valid_pixels = valid_count
-        print(f"[Warning] Skip DA3 scale alignment: only {valid_count} positive ratios.")
-        return 1.0, valid_count
-
-    if 0.0 < trim_quantile < 0.5 and ratios.numel() > 2:
-        lower = torch.quantile(ratios, trim_quantile)
-        upper = torch.quantile(ratios, 1.0 - trim_quantile)
-        trimmed = ratios[(ratios >= lower) & (ratios <= upper)]
-        if trimmed.numel() > 0:
-            ratios = trimmed
-
-    scale = float(torch.median(ratios).item())
-    if not np.isfinite(scale) or scale <= 0:
-        print(f"[Warning] Skip DA3 scale alignment: invalid scale {scale}.")
-        return 1.0, valid_count
-
-    result.pred_depthmap = result.pred_depthmap * scale
-    result.pred_2d_uniform_depth = result.pred_2d_uniform_depth * scale
-    result.depth_scale_align_factor *= scale
-    return scale, valid_count
 
 
 def build_point_cloud_from_depth_result(
