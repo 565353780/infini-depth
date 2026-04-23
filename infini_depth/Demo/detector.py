@@ -1,6 +1,5 @@
 import sys
 sys.path.append('../camera-control')
-sys.path.append('../../../camera-control')
 
 import os
 import cv2
